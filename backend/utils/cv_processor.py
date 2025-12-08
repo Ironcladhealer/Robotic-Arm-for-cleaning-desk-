@@ -1,71 +1,86 @@
-# backend/utils/cv_processor.py
-
-from ultralytics import YOLO
+import cv2
 import numpy as np
+import os
 
 # --- Configuration ---
-# Replace 'yolov8n.pt' with your specific trash model path if you have one!
-MODEL_PATH = 'yolov8n.pt'
-CONFIDENCE_THRESHOLD = 0.5
-TARGET_CLASS_ID = 0 # Placeholder for 'paper' or 'trash' class index
+# Path to the single reference image (the empty scene/background)
+REFERENCE_IMAGE_PATH = 'data/reference_background.jpg' 
+MIN_AREA_THRESHOLD = 300 # Minimum size of the object contour
+DIFF_THRESHOLD = 30 # Pixel intensity threshold for binary conversion
 
 class CVProcessor:
     def __init__(self):
-        """Initializes and loads the YOLO model."""
-        self.model = None
-        self.load_model()
+        """Initializes by loading the reference background image."""
+        self.reference_frame = None
+        self.load_reference_image()
 
-    def load_model(self):
-        """Loads the YOLO model using the ultralytics library."""
-        try:
-            print(f"INFO: Loading YOLO model from {MODEL_PATH}...")
-            # Load the model weights
-            self.model = YOLO(MODEL_PATH) 
-            print("INFO: YOLO model loaded successfully.")
-        except Exception as e:
-            print(f"ERROR: Failed to load YOLO model: {e}")
-            self.model = None
+    def load_reference_image(self):
+        """Loads the reference image in grayscale."""
+        if not os.path.exists(REFERENCE_IMAGE_PATH):
+            print(f"ERROR: Reference image not found at {REFERENCE_IMAGE_PATH}")
+            self.reference_frame = None
+            return
 
-    def detect_trash(self, image_path):
+        # Load the image in grayscale (0)
+        self.reference_frame = cv2.imread(REFERENCE_IMAGE_PATH, 0) 
+        
+        if self.reference_frame is not None:
+            print("INFO: Reference background image loaded successfully.")
+        else:
+            print("ERROR: Failed to load reference image. Check file path and integrity.")
+
+    def detect_trash(self, current_image_path):
         """
-        Runs YOLO detection on an image.
-        Returns: True/False for detection success, and a dictionary of coordinates.
+        Detects movement/new objects using background subtraction.
+        Returns: True/False for detection success, and coordinates if found.
         """
-        if not self.model:
-            print("ERROR: Model is not available for detection.")
+        if self.reference_frame is None:
+            print("ERROR: Cannot detect trash, reference frame is missing.")
             return False, None
 
-        # Run inference on the image
-        # verbose=False suppresses the console output from YOLO
-        results = self.model(image_path, verbose=False)
+        # 1. Load the current frame in grayscale
+        frame = cv2.imread(current_image_path, 0)
+        if frame is None:
+             print(f"ERROR: Failed to load current image at {current_image_path}.")
+             return False, None
+        
+        # Ensure frames are the same size before comparison
+        if frame.shape != self.reference_frame.shape:
+             print("ERROR: Reference and current frame sizes do not match.")
+             return False, None
+        
+        # 2. Compute absolute difference between the reference and the new frame
+        diff = cv2.absdiff(self.reference_frame, frame)
+        
+        # 3. Apply threshold to get a binary mask of the differences
+        # Pixels with difference > DIFF_THRESHOLD become white (255)
+        _, thresh = cv2.threshold(diff, DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        
+        # 4. Optional: Dilate the thresholded image to fill holes (improves contour finding)
+        # thresh = cv2.dilate(thresh, None, iterations=2)
 
-        for r in results:
-            boxes = r.boxes
-            if len(boxes) > 0:
-                # Iterate through all detections
-                for i in range(len(boxes)):
-                    confidence = boxes.conf[i].item()
-                    cls = int(boxes.cls[i].item())
-                    box = boxes.xyxy[i].tolist() # [x_min, y_min, x_max, y_max]
+        # 5. Find contours (new objects/movement)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                    # Check if it meets the criteria (confidence > threshold AND correct class)
-                    # NOTE: For now, we accept any object with high confidence as trash.
-                    if confidence >= CONFIDENCE_THRESHOLD: # and cls == TARGET_CLASS_ID:
-                        
-                        # Calculate the center coordinates for the robotic arm
-                        x_center = (box[0] + box[2]) / 2
-                        y_center = (box[1] + box[3]) / 2
-                        
-                        coordinates = {
-                            "x_center": x_center, 
-                            "y_center": y_center, 
-                            "bounding_box": box,
-                            "confidence": confidence
-                        }
-                        
-                        print(f"DETECTED: Class {cls}, Conf: {confidence:.2f}")
-                        return True, coordinates
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
             
+            # Check if the object is large enough to be considered trash
+            if area > MIN_AREA_THRESHOLD:
+                x, y, w, h = cv2.boundingRect(cnt)
+                
+                # Trash detected!
+                coordinates = {
+                    "x_center": x + w / 2, 
+                    "y_center": y + h / 2, 
+                    "bounding_box": [x, y, x + w, y + h],
+                    "area": area
+                }
+                
+                print(f"DETECTED: Object found (Area: {area}) at center ({coordinates['x_center']:.2f}, {coordinates['y_center']:.2f})")
+                return True, coordinates
+            
+        # No object large enough was found
         return False, None
 
 # Initialize the processor immediately when the server starts
