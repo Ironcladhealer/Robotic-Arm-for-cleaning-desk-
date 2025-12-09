@@ -1,58 +1,84 @@
+# backend/app.py
+
 from flask import Flask, request, jsonify
 import os
 import time
+# Import all three utility files
 from utils.cv_processor import cv_processor
+from utils.distance import estimate_distance
+from utils.inverse_kinematics import calculate_ik_angles
 
 app = Flask(__name__)
 
-# Create the directory to save images if it doesn't exist
+# --- Configuration ---
 DATA_FOLDER = 'data'
 if not os.path.exists(DATA_FOLDER):
     os.makedirs(DATA_FOLDER)
 
-# Global flag to control the ESP32 (state management)
 is_garbage_detected = False
+
+@app.route('/log', methods=['POST'])
+def receive_log():
+    """Receives and prints debug messages from the ESP32-CAM."""
+    if request.method == 'POST':
+        try:
+            log_message = request.data.decode('utf-8')
+            print(f"[ESP32 LOG]: {log_message}")
+            return jsonify({"status": "received"}), 200
+        except Exception as e:
+            return jsonify({"status": "error", "message": str(e)}), 500
+    return jsonify({"status": "error"}), 400
 
 @app.route('/upload', methods=['POST'])
 def upload_image():
-    """Receives a JPEG image POSTed by the ESP32-CAM and saves it."""
     global is_garbage_detected
     
-    # 1. Check stop flag first
     if is_garbage_detected:
-        # Confirm detection to ESP32 and tell it to stop
-        return jsonify({"status": "STOP", "message": "Trash already found, halt capture."}), 200
-    
+        # If detected, tell the ESP32 to stop (or confirm stop)
+        return jsonify({"status": "STOP", "message": "Trash found. Robot moving."}), 200
+
     if request.method == 'POST':
         if not request.data:
             return jsonify({"status": "error", "message": "No image data received"}), 400
         
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         filename = os.path.join(DATA_FOLDER, f"capture_{timestamp}.jpg")
-        image_data = request.data
         
         try:
-            # --- 2. Save Image ---
+            # --- 1. Save Image ---
             with open(filename, 'wb') as f:
-                f.write(image_data)
+                f.write(request.data)
             
-            print(f"INFO: Image saved as {filename}")
-
-            # --- 3. Run Detection using the external processor ---
-            trash_found, coordinates = cv_processor.detect_trash(filename)
+            # --- 2. Detection (cv_processor.py) ---
+            trash_found, coords_px = cv_processor.detect_trash(filename)
             
             if trash_found:
-                is_garbage_detected = True # Set the global flag
-                print("--- GARBAGE DETECTED! SWITCHING TO ROBOT MODE ---")
+                # --- 3. Distance Estimation (distance.py) ---
+                width_pixels = coords_px["width_pixels"]
+                distance_cm = estimate_distance(width_pixels)
                 
-                # Send the signal to stop capture and the coordinates for the arm
+                if distance_cm is None:
+                     return jsonify({"status": "CONTINUE", "message": "Trash found but distance failed."}), 200
+
+                # --- 4. Inverse Kinematics (inverse_kinematics.py) ---
+                servo_angles = calculate_ik_angles(coords_px, distance_cm)
+
+                if servo_angles is None:
+                     return jsonify({"status": "CONTINUE", "message": "Trash found but target unreachable."}), 200
+
+                # --- 5. Success! Prepare Final Response ---
+                is_garbage_detected = True 
+                print(f"IK Success. Angles: {servo_angles}")
+                
+                # Send the final command (angles) and stop signal to ESP32
                 return jsonify({
-                    "status": "DETECTED", 
+                    "status": "DETECTED_AND_COMMAND", 
                     "stop_capture": True,
-                    "target_coords": coordinates 
+                    "target_angles": servo_angles,  # <--- Send the calculated angles!
+                    "reach_cm": f"{distance_cm:.2f}"
                 }), 200
             
-            # --- 4. No Trash Found ---
+            # --- 6. No Trash Found ---
             return jsonify({
                 "status": "CONTINUE", 
                 "stop_capture": False,
@@ -60,9 +86,10 @@ def upload_image():
             }), 200
 
         except Exception as e:
-            print(f"ERROR: Failed to process image: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500400
+            print(f"CRITICAL ERROR: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
 
-# --- Running the Server ---
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded = True)
+    # Start the Flask server
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
